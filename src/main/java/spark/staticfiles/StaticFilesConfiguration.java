@@ -33,11 +33,9 @@ import org.slf4j.LoggerFactory;
 
 import spark.resource.AbstractFileResolvingResource;
 import spark.resource.AbstractResourceHandler;
-import spark.resource.ClassPathResource;
 import spark.resource.ClassPathResourceHandler;
 import spark.resource.ExternalResource;
 import spark.resource.ExternalResourceHandler;
-import spark.resource.JarResourceHandler;
 import spark.utils.Assert;
 import spark.utils.GzipUtils;
 import spark.utils.IOUtils;
@@ -50,7 +48,6 @@ public class StaticFilesConfiguration {
     private final Logger LOG = LoggerFactory.getLogger(StaticFilesConfiguration.class);
 
     private List<AbstractResourceHandler> staticResourceHandlers = null;
-    private List<JarResourceHandler> jarResourceHandlers = null;
 
     private boolean staticResourcesSet = false;
     private boolean externalStaticResourcesSet = false;
@@ -69,15 +66,18 @@ public class StaticFilesConfiguration {
      */
     public boolean consume(HttpServletRequest httpRequest,
                            HttpServletResponse httpResponse) throws IOException {
+        try {
+            if (consumeWithFileResourceHandlers(httpRequest, httpResponse)) {
+                return true;
+            }
 
-        if (consumeWithFileResourceHandlers(httpRequest, httpResponse)) {
-            return true;
+        } catch (DirectoryTraversal.DirectoryTraversalDetection directoryTraversalDetection) {
+            httpResponse.setStatus(400);
+            httpResponse.getWriter().write("Bad request");
+            httpResponse.getWriter().flush();
+            LOG.warn(directoryTraversalDetection.getMessage() + " directory traversal detection for path: "
+                             + httpRequest.getPathInfo());
         }
-
-        if (consumeWithJarResourceHandler(httpRequest, httpResponse)) {
-            return true;
-        }
-
         return false;
     }
 
@@ -91,39 +91,21 @@ public class StaticFilesConfiguration {
                 AbstractFileResolvingResource resource = staticResourceHandler.getResource(httpRequest);
 
                 if (resource != null && resource.isReadable()) {
-                    httpResponse.setHeader(MimeType.CONTENT_TYPE, MimeType.fromResource(resource));
+
+                    if (MimeType.shouldGuess()) {
+                        httpResponse.setHeader(MimeType.CONTENT_TYPE, MimeType.fromResource(resource));
+                    }
                     customHeaders.forEach(httpResponse::setHeader); //add all user-defined headers to response
-                    OutputStream wrappedOutputStream = GzipUtils.checkAndWrap(httpRequest, httpResponse, false);
-                    
-                    IOUtils.copy(resource.getInputStream(), wrappedOutputStream);
-                    wrappedOutputStream.flush();
-                    wrappedOutputStream.close();
+
+                    try (InputStream inputStream = resource.getInputStream();
+                         OutputStream wrappedOutputStream = GzipUtils.checkAndWrap(httpRequest, httpResponse, false)) {
+                        IOUtils.copy(inputStream, wrappedOutputStream);
+                    }
+
                     return true;
                 }
             }
 
-        }
-        return false;
-    }
-
-    private boolean consumeWithJarResourceHandler(HttpServletRequest httpRequest,
-                                                  HttpServletResponse httpResponse) throws IOException {
-        if (jarResourceHandlers != null) {
-
-            for (JarResourceHandler jarResourceHandler : jarResourceHandlers) {
-                InputStream stream = jarResourceHandler.getResource(httpRequest);
-
-                if (stream != null) {
-                    httpResponse.setHeader(MimeType.CONTENT_TYPE, MimeType.fromPathInfo(httpRequest.getPathInfo()));
-                    customHeaders.forEach(httpResponse::setHeader); //add all user-defined headers to response
-                    OutputStream wrappedOutputStream = GzipUtils.checkAndWrap(httpRequest, httpResponse, false);
-
-                    IOUtils.copy(stream, wrappedOutputStream);
-                    wrappedOutputStream.flush();
-                    wrappedOutputStream.close();
-                    return true;
-                }
-            }
         }
         return false;
     }
@@ -138,13 +120,16 @@ public class StaticFilesConfiguration {
             staticResourceHandlers = null;
         }
 
-        if (jarResourceHandlers != null) {
-            jarResourceHandlers.clear();
-            jarResourceHandlers = null;
-        }
-
         staticResourcesSet = false;
         externalStaticResourcesSet = false;
+    }
+    
+    public boolean isStaticResourcesSet() {
+        return staticResourcesSet;
+    }
+    
+    public boolean isExternalStaticResourcesSet() {
+        return externalStaticResourcesSet;
     }
 
     /**
@@ -156,51 +141,16 @@ public class StaticFilesConfiguration {
         Assert.notNull(folder, "'folder' must not be null");
 
         if (!staticResourcesSet) {
-            try {
-                ClassPathResource resource = new ClassPathResource(folder);
 
-                if (configureJarCase(folder, resource)) {
-                    return;
-                }
-
-                if (!resource.getFile().isDirectory()) {
-                    LOG.error("Static resource location must be a folder");
-                    return;
-                }
-
-                if (staticResourceHandlers == null) {
-                    staticResourceHandlers = new ArrayList<>();
-                }
-
-                staticResourceHandlers.add(new ClassPathResourceHandler(folder, "index.html"));
-                LOG.info("StaticResourceHandler configured with folder = " + folder);
-            } catch (IOException e) {
-                LOG.error("Error when creating StaticResourceHandler", e);
+            if (staticResourceHandlers == null) {
+                staticResourceHandlers = new ArrayList<>();
             }
+
+            staticResourceHandlers.add(new ClassPathResourceHandler(folder, "index.html"));
+            LOG.info("StaticResourceHandler configured with folder = " + folder);
+            StaticFilesFolder.localConfiguredTo(folder);
             staticResourcesSet = true;
         }
-
-    }
-
-    private boolean configureJarCase(String folder, ClassPathResource resource) throws IOException {
-        if (resource.getURL().getProtocol().equals("jar")) {
-
-            InputStream stream = StaticFilesConfiguration.class.getResourceAsStream(folder);
-
-            if (stream != null) {
-                if (jarResourceHandlers == null) {
-                    jarResourceHandlers = new ArrayList<>();
-                }
-
-                // Add jar file resource handler
-                jarResourceHandlers.add(new JarResourceHandler(folder, "index.html"));
-                staticResourcesSet = true;
-                return true;
-            }
-            
-            LOG.error("Static file configuration failed.");
-        }
-        return false;
     }
 
     /**
@@ -227,9 +177,10 @@ public class StaticFilesConfiguration {
             } catch (IOException e) {
                 LOG.error("Error when creating external StaticResourceHandler", e);
             }
+
+            StaticFilesFolder.externalConfiguredTo(folder);
             externalStaticResourcesSet = true;
         }
-
     }
 
     public static StaticFilesConfiguration create() {

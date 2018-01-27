@@ -16,10 +16,14 @@
  */
 package spark;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,6 +33,7 @@ import spark.embeddedserver.EmbeddedServers;
 import spark.embeddedserver.jetty.websocket.WebSocketHandlerClassWrapper;
 import spark.embeddedserver.jetty.websocket.WebSocketHandlerInstanceWrapper;
 import spark.embeddedserver.jetty.websocket.WebSocketHandlerWrapper;
+import spark.route.HttpMethod;
 import spark.route.Routes;
 import spark.route.ServletRoutes;
 import spark.ssl.SslStores;
@@ -60,9 +65,6 @@ public final class Service extends Routable {
 
     protected SslStores sslStores;
 
-    protected String staticFileFolder = null;
-    protected String externalStaticFileFolder = null;
-
     protected Map<String, WebSocketHandlerWrapper> webSocketHandlers = null;
 
     protected int maxThreads = -1;
@@ -71,10 +73,8 @@ public final class Service extends Routable {
     protected Optional<Integer> webSocketIdleTimeoutMillis = Optional.empty();
 
     protected EmbeddedServer server;
+    protected Deque<String> pathDeque = new ArrayDeque<>();
     protected Routes routes;
-
-    private boolean servletStaticLocationSet;
-    private boolean servletExternalStaticLocationSet;
 
     private CountDownLatch latch = new CountDownLatch(1);
 
@@ -84,6 +84,13 @@ public final class Service extends Routable {
     public final StaticFiles staticFiles;
 
     private final StaticFilesConfiguration staticFilesConfiguration;
+    private final ExceptionMapper exceptionMapper = ExceptionMapper.getInstance();
+
+    // default exception handler during initialization phase
+    private Consumer<Exception> initExceptionHandler = (e) -> {
+        LOG.error("ignite failed", e);
+        System.exit(100);
+    };
 
     /**
      * Creates a new Service (a Spark instance). This should be used instead of the static API if the user wants
@@ -157,7 +164,7 @@ public final class Service extends Routable {
      * Set the connection to be secure, using the specified keystore and
      * truststore. This has to be called before any route mapping is done. You
      * have to supply a keystore file, truststore file is optional (keystore
-     * will be reused).
+     * will be reused). By default, client certificates are not checked.
      * This method is only relevant when using embedded Jetty servers. It should
      * not be used if you are using Servlets, where you will need to secure the
      * connection in the servlet container
@@ -173,6 +180,32 @@ public final class Service extends Routable {
                                        String keystorePassword,
                                        String truststoreFile,
                                        String truststorePassword) {
+        return secure(keystoreFile, keystorePassword, truststoreFile, truststorePassword, false);
+    }
+
+    /**
+     * Set the connection to be secure, using the specified keystore and
+     * truststore. This has to be called before any route mapping is done. You
+     * have to supply a keystore file, truststore file is optional (keystore
+     * will be reused).
+     * This method is only relevant when using embedded Jetty servers. It should
+     * not be used if you are using Servlets, where you will need to secure the
+     * connection in the servlet container
+     *
+     * @param keystoreFile       The keystore file location as string
+     * @param keystorePassword   the password for the keystore
+     * @param truststoreFile     the truststore file location as string, leave null to reuse
+     *                           keystore
+     * @param needsClientCert    Whether to require client certificate to be supplied in
+     *                           request
+     * @param truststorePassword the trust store password
+     * @return the object with connection set to be secure
+     */
+    public synchronized Service secure(String keystoreFile,
+                                       String keystorePassword,
+                                       String truststoreFile,
+                                       String truststorePassword,
+                                       boolean needsClientCert) {
         if (initialized) {
             throwBeforeRouteMappingException();
         }
@@ -182,7 +215,7 @@ public final class Service extends Routable {
                     "Must provide a keystore file to run secured");
         }
 
-        sslStores = SslStores.create(keystoreFile, keystorePassword, truststoreFile, truststorePassword);
+        sslStores = SslStores.create(keystoreFile, keystorePassword, truststoreFile, truststorePassword, needsClientCert);
         return this;
     }
 
@@ -227,12 +260,9 @@ public final class Service extends Routable {
         if (initialized && !isRunningFromServlet()) {
             throwBeforeRouteMappingException();
         }
-
-        staticFileFolder = folder;
-
-        if (!servletStaticLocationSet) {
-            staticFilesConfiguration.configure(staticFileFolder);
-            servletStaticLocationSet = true;
+        
+        if (!staticFilesConfiguration.isStaticResourcesSet()) {
+            staticFilesConfiguration.configure(folder);
         } else {
             LOG.warn("Static file location has already been set");
         }
@@ -250,12 +280,9 @@ public final class Service extends Routable {
         if (initialized && !isRunningFromServlet()) {
             throwBeforeRouteMappingException();
         }
-
-        externalStaticFileFolder = externalFolder;
-
-        if (!servletExternalStaticLocationSet) {
-            staticFilesConfiguration.configureExternal(externalStaticFileFolder);
-            servletExternalStaticLocationSet = true;
+        
+        if (!staticFilesConfiguration.isExternalStaticResourcesSet()) {
+            staticFilesConfiguration.configureExternal(externalFolder);
         } else {
             LOG.warn("External static file location has already been set");
         }
@@ -267,13 +294,13 @@ public final class Service extends Routable {
      * <p>
      * This is currently only available in the embedded server mode.
      *
-     * @param path    the WebSocket path.
-     * @param handler the handler class that will manage the WebSocket connection to the given path.
+     * @param path         the WebSocket path.
+     * @param handlerClass the handler class that will manage the WebSocket connection to the given path.
      */
     public void webSocket(String path, Class<?> handlerClass) {
         addWebSocketHandler(path, new WebSocketHandlerClassWrapper(handlerClass));
     }
-    
+
     /**
      * Maps the given path to the given WebSocket handler instance.
      * <p>
@@ -285,14 +312,14 @@ public final class Service extends Routable {
     public void webSocket(String path, Object handler) {
         addWebSocketHandler(path, new WebSocketHandlerInstanceWrapper(handler));
     }
-    
+
     private synchronized void addWebSocketHandler(String path, WebSocketHandlerWrapper handlerWrapper) {
         if (initialized) {
             throwBeforeRouteMappingException();
         }
         if (isRunningFromServlet()) {
             throw new IllegalStateException("WebSockets are only supported in the embedded server");
-        }       
+        }
         requireNonNull(path, "WebSocket path cannot be null");
         if (webSocketHandlers == null) {
             webSocketHandlers = new HashMap<>();
@@ -319,14 +346,51 @@ public final class Service extends Routable {
     }
 
     /**
+     * Maps 404 errors to the provided custom page
+     *
+     * @param page the custom 404 error page.
+     */
+    public synchronized void notFound(String page) {
+        CustomErrorPages.add(404, page);
+    }
+
+    /**
+     * Maps 500 internal server errors to the provided custom page
+     *
+     * @param page the custom 500 internal server error page.
+     */
+    public synchronized void internalServerError(String page) {
+        CustomErrorPages.add(500, page);
+    }
+
+    /**
+     * Maps 404 errors to the provided route.
+     */
+    public synchronized void notFound(Route route) {
+        CustomErrorPages.add(404, route);
+    }
+
+    /**
+     * Maps 500 internal server errors to the provided route.
+     */
+    public synchronized void internalServerError(Route route) {
+        CustomErrorPages.add(500, route);
+    }
+
+    /**
      * Waits for the spark server to be initialized.
      * If it's already initialized will return immediately
      */
     public void awaitInitialization() {
+        if (!initialized) {
+    	        throw new IllegalStateException("Server has not been properly initialized");
+        }
+
         try {
             latch.await();
         } catch (InterruptedException e) {
             LOG.info("Interrupted by another thread");
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -346,26 +410,66 @@ public final class Service extends Routable {
     public synchronized void stop() {
         new Thread(() -> {
             if (server != null) {
-                routes.clear();
                 server.extinguish();
                 latch = new CountDownLatch(1);
             }
-
+            
+            routes.clear();
+            exceptionMapper.clear();
             staticFilesConfiguration.clear();
             initialized = false;
         }).start();
     }
 
-    @Override
-    public void addRoute(String httpMethod, RouteImpl route) {
-        init();
-        routes.add(httpMethod + " '" + route.getPath() + "'", route.getAcceptType(), route);
+    /**
+     * Add a path-prefix to the routes declared in the routeGroup
+     * The path() method adds a path-fragment to a path-stack, adds
+     * routes from the routeGroup, then pops the path-fragment again.
+     * It's used for separating routes into groups, for example:
+     * path("/api/email", () -> {
+     * ....post("/add",       EmailApi::addEmail);
+     * ....put("/change",     EmailApi::changeEmail);
+     * ....etc
+     * });
+     * Multiple path() calls can be nested.
+     *
+     * @param path       the path to prefix routes with
+     * @param routeGroup group of routes (can also contain path() calls)
+     */
+    public void path(String path, RouteGroup routeGroup) {
+        pathDeque.addLast(path);
+        routeGroup.addRoutes();
+        pathDeque.removeLast();
+    }
+
+    public String getPaths() {
+        return pathDeque.stream().collect(Collectors.joining(""));
     }
 
     @Override
+    public void addRoute(HttpMethod httpMethod, RouteImpl route) {
+        init();
+        routes.add(httpMethod, route.withPrefix(getPaths()));
+    }
+
+    @Override
+    public void addFilter(HttpMethod httpMethod, FilterImpl filter) {
+        init();
+        routes.add(httpMethod, filter.withPrefix(getPaths()));
+    }
+
+    @Override
+    @Deprecated
+    public void addRoute(String httpMethod, RouteImpl route) {
+        init();
+        routes.add(httpMethod + " '" + getPaths() + route.getPath() + "'", route.getAcceptType(), route);
+    }
+
+    @Override
+    @Deprecated
     public void addFilter(String httpMethod, FilterImpl filter) {
         init();
-        routes.add(httpMethod + " '" + filter.getPath() + "'", filter.getAcceptType(), filter);
+        routes.add(httpMethod + " '" + getPaths() + filter.getPath() + "'", filter.getAcceptType(), filter);
     }
 
     public synchronized void init() {
@@ -375,6 +479,7 @@ public final class Service extends Routable {
 
             if (!isRunningFromServlet()) {
                 new Thread(() -> {
+                  try {
                     EmbeddedServers.initialize();
 
                     if (embeddedServerIdentifier == null) {
@@ -392,10 +497,19 @@ public final class Service extends Routable {
                             ipAddress,
                             port,
                             sslStores,
-                            latch,
                             maxThreads,
                             minThreads,
                             threadIdleTimeoutMillis);
+                  } catch (Exception e) {
+                    initExceptionHandler.accept(e);
+                  }
+                    try {
+                        latch.countDown();
+                        server.join();
+                    } catch (InterruptedException e) {
+                        LOG.error("server interrupted", e);
+                        Thread.currentThread().interrupt();
+                    }
                 }).start();
             }
             initialized = true;
@@ -410,6 +524,16 @@ public final class Service extends Routable {
         }
     }
 
+    /**
+     * @return The approximate number of currently active threads in the embedded Jetty server
+     */
+    public synchronized int activeThreadCount() {
+        if (server != null) {
+            return server.activeThreadCount();
+        }
+        return 0;
+    }
+
     //////////////////////////////////////////////////
     // EXCEPTION mapper
     //////////////////////////////////////////////////
@@ -420,16 +544,16 @@ public final class Service extends Routable {
      * @param exceptionClass the exception class
      * @param handler        The handler
      */
-    public synchronized void exception(Class<? extends Exception> exceptionClass, ExceptionHandler handler) {
+    public synchronized <T extends Exception> void exception(Class<T> exceptionClass, ExceptionHandler<? super T> handler) {
         // wrap
-        ExceptionHandlerImpl wrapper = new ExceptionHandlerImpl(exceptionClass) {
+        ExceptionHandlerImpl wrapper = new ExceptionHandlerImpl<T>(exceptionClass) {
             @Override
-            public void handle(Exception exception, Request request, Response response) {
+            public void handle(T exception, Request request, Response response) {
                 handler.handle(exception, request, response);
             }
         };
 
-        ExceptionMapper.getInstance().map(exceptionClass, wrapper);
+        exceptionMapper.map(exceptionClass, wrapper);
     }
 
     //////////////////////////////////////////////////
@@ -482,6 +606,18 @@ public final class Service extends Routable {
      */
     public HaltException halt(int status, String body) {
         throw new HaltException(status, body);
+    }
+
+    /**
+     * Overrides default exception handler during initialization phase
+     *
+     * @param initExceptionHandler The custom init exception handler
+     */
+    public void initExceptionHandler(Consumer<Exception> initExceptionHandler) {
+        if (initialized) {
+            throwBeforeRouteMappingException();
+        }
+        this.initExceptionHandler = initExceptionHandler;
     }
 
     /**
@@ -548,6 +684,13 @@ public final class Service extends Routable {
          */
         public void registerMimeType(String extension, String mimeType) {
             MimeType.register(extension, mimeType);
+        }
+
+        /**
+         * Disables the automatic setting of Content-Type header made from a guess based on extension.
+         */
+        public void disableMimeTypeGuessing() {
+            MimeType.disableGuessing();
         }
 
     }
